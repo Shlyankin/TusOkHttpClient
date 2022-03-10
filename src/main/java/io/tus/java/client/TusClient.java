@@ -7,6 +7,12 @@ import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 /**
  * This class is used for creating or resuming uploads.
@@ -18,6 +24,7 @@ public class TusClient {
      */
     public static final String TUS_VERSION = "1.0.0";
 
+    private OkHttpClient okHttpClient;
     private URL uploadCreationURL;
     private boolean resumingEnabled;
     private boolean removeFingerprintOnSuccessEnabled;
@@ -76,10 +83,9 @@ public class TusClient {
     /**
      * Get the current status if resuming.
      *
+     * @return True if resuming has been enabled using {@link #enableResuming(TusURLStore)}
      * @see #enableResuming(TusURLStore)
      * @see #disableResuming()
-     *
-     * @return True if resuming has been enabled using {@link #enableResuming(TusURLStore)}
      */
     public boolean resumingEnabled() {
         return resumingEnabled;
@@ -106,10 +112,9 @@ public class TusClient {
     /**
      * Get the current status if removing fingerprints after a successful upload.
      *
+     * @return True if resuming has been enabled using {@link #enableResuming(TusURLStore)}
      * @see #enableRemoveFingerprintOnSuccess()
      * @see #disableRemoveFingerprintOnSuccess()
-     *
-     * @return True if resuming has been enabled using {@link #enableResuming(TusURLStore)}
      */
     public boolean removeFingerprintOnSuccessEnabled() {
         return removeFingerprintOnSuccessEnabled;
@@ -121,10 +126,8 @@ public class TusClient {
      * These may to overwrite tus-specific headers, which can be identified by their Tus-*
      * prefix, and can cause unexpected behavior.
      *
-     * @see #getHeaders()
-     * @see #prepareConnection(HttpURLConnection)
-     *
      * @param headers The map of HTTP headers
+     * @see #getHeaders()
      */
     public void setHeaders(@Nullable Map<String, String> headers) {
         this.headers = headers;
@@ -134,10 +137,8 @@ public class TusClient {
      * Get the HTTP headers which should be contained in every request and were configured using
      * {@link #setHeaders(Map)}.
      *
-     * @see #setHeaders(Map)
-     * @see #prepareConnection(HttpURLConnection)
-     *
      * @return The map of configured HTTP headers
+     * @see #setHeaders(Map)
      */
     @Nullable
     public Map<String, String> getHeaders() {
@@ -146,6 +147,7 @@ public class TusClient {
 
     /**
      * Sets the timeout for a Connection.
+     *
      * @param timeout in milliseconds
      */
     public void setConnectTimeout(int timeout) {
@@ -154,6 +156,7 @@ public class TusClient {
 
     /**
      * Returns the Connection Timeout.
+     *
      * @return Timeout in milliseconds.
      */
     public int getConnectTimeout() {
@@ -170,37 +173,42 @@ public class TusClient {
      * @param upload The file for which a new upload will be created
      * @return Use {@link TusUploader} to upload the file's chunks.
      * @throws ProtocolException Thrown if the remote server sent an unexpected response, e.g.
-     * wrong status codes or missing/invalid headers.
-     * @throws IOException Thrown if an exception occurs while issuing the HTTP request.
+     *                           wrong status codes or missing/invalid headers.
+     * @throws IOException       Thrown if an exception occurs while issuing the HTTP request.
      */
     public TusUploader createUpload(@NotNull TusUpload upload) throws ProtocolException, IOException {
-        HttpURLConnection connection = (HttpURLConnection) uploadCreationURL.openConnection();
-        connection.setRequestMethod("POST");
-        prepareConnection(connection);
+
+        OkHttpClient okHttpClient = getOrCreateOkHttpClient();
+        Request.Builder requestBuilder = getRequestBuilderWithHeaders()
+                .url(uploadCreationURL)
+                .post(RequestBody.create(null, new byte[0]));
 
         String encodedMetadata = upload.getEncodedMetadata();
         if (encodedMetadata.length() > 0) {
-            connection.setRequestProperty("Upload-Metadata", encodedMetadata);
+            requestBuilder.addHeader("Upload-Metadata", encodedMetadata);
         }
 
-        connection.addRequestProperty("Upload-Length", Long.toString(upload.getSize()));
-        connection.connect();
+        requestBuilder.addHeader("Upload-Length", Long.toString(upload.getSize()));
 
-        int responseCode = connection.getResponseCode();
+        Request request = requestBuilder.build();
+        Response response = okHttpClient.newCall(request).execute();
+
+        int responseCode = response.code();
+
         if (!(responseCode >= 200 && responseCode < 300)) {
             throw new ProtocolException(
-                    "unexpected status code (" + responseCode + ") while creating upload", connection);
+                    "unexpected status code (" + responseCode + ") while creating upload");
         }
 
-        String urlStr = connection.getHeaderField("Location");
+        String urlStr = response.header("Location");
         if (urlStr == null || urlStr.length() == 0) {
-            throw new ProtocolException("missing upload URL in response for creating upload", connection);
+            throw new ProtocolException("missing upload URL in response for creating upload");
         }
 
         // The upload URL must be relative to the URL of the request by which is was returned,
         // not the upload creation URL. In most cases, there is no difference between those two
         // but there may be cases in which the POST request is redirected.
-        URL uploadURL = new URL(connection.getURL(), urlStr);
+        URL uploadURL = new URL(request.url().url(), urlStr);
 
         if (resumingEnabled) {
             urlStore.set(upload.getFingerprint(), uploadURL);
@@ -219,12 +227,12 @@ public class TusClient {
      * @param upload The file for which an upload will be resumed
      * @return Use {@link TusUploader} to upload the remaining file's chunks.
      * @throws FingerprintNotFoundException Thrown if no matching fingerprint has been found in
-     * {@link TusURLStore}. Use {@link #createUpload(TusUpload)} to create a new upload.
-     * @throws ResumingNotEnabledException Throw if resuming has not been enabled using {@link
-     * #enableResuming(TusURLStore)}.
-     * @throws ProtocolException Thrown if the remote server sent an unexpected response, e.g.
-     * wrong status codes or missing/invalid headers.
-     * @throws IOException Thrown if an exception occurs while issuing the HTTP request.
+     *                                      {@link TusURLStore}. Use {@link #createUpload(TusUpload)} to create a new upload.
+     * @throws ResumingNotEnabledException  Throw if resuming has not been enabled using {@link
+     *                                      #enableResuming(TusURLStore)}.
+     * @throws ProtocolException            Thrown if the remote server sent an unexpected response, e.g.
+     *                                      wrong status codes or missing/invalid headers.
+     * @throws IOException                  Thrown if an exception occurs while issuing the HTTP request.
      */
     public TusUploader resumeUpload(@NotNull TusUpload upload) throws
             FingerprintNotFoundException, ResumingNotEnabledException, ProtocolException, IOException {
@@ -250,30 +258,31 @@ public class TusClient {
      * When called a HEAD request will be issued to find the current offset without uploading the file, yet.
      * The uploading can be started by using the returned {@link TusUploader} object.
      *
-     * @param upload The file for which an upload will be resumed
+     * @param upload    The file for which an upload will be resumed
      * @param uploadURL The upload location URL at which has already been created and this file should be uploaded to.
      * @return Use {@link TusUploader} to upload the remaining file's chunks.
      * @throws ProtocolException Thrown if the remote server sent an unexpected response, e.g.
-     * wrong status codes or missing/invalid headers.
-     * @throws IOException Thrown if an exception occurs while issuing the HTTP request.
+     *                           wrong status codes or missing/invalid headers.
+     * @throws IOException       Thrown if an exception occurs while issuing the HTTP request.
      */
     public TusUploader beginOrResumeUploadFromURL(@NotNull TusUpload upload, @NotNull URL uploadURL) throws
             ProtocolException, IOException {
-        HttpURLConnection connection = (HttpURLConnection) uploadURL.openConnection();
-        connection.setRequestMethod("HEAD");
-        prepareConnection(connection);
+        OkHttpClient okHttpClient = getOrCreateOkHttpClient();
+        Request.Builder requestBuilder = getRequestBuilderWithHeaders()
+                .url(uploadURL);
+        requestBuilder.head();
+        Request request = requestBuilder.build();
+        Response response = okHttpClient.newCall(request).execute();
 
-        connection.connect();
-
-        int responseCode = connection.getResponseCode();
+        int responseCode = response.code();
         if (!(responseCode >= 200 && responseCode < 300)) {
             throw new ProtocolException(
-                    "unexpected status code (" + responseCode + ") while resuming upload", connection);
+                    "unexpected status code (" + responseCode + ") while resuming upload");
         }
 
-        String offsetStr = connection.getHeaderField("Upload-Offset");
+        String offsetStr = response.header("Upload-Offset");
         if (offsetStr == null || offsetStr.length() == 0) {
-            throw new ProtocolException("missing upload offset in response for resuming upload", connection);
+            throw new ProtocolException("missing upload offset in response for resuming upload");
         }
         long offset = Long.parseLong(offsetStr);
 
@@ -286,10 +295,10 @@ public class TusClient {
      * will be created using {@link #createUpload(TusUpload)}.
      *
      * @param upload The file for which an upload will be resumed
-     * @throws ProtocolException Thrown if the remote server sent an unexpected response, e.g.
-     * wrong status codes or missing/invalid headers.
-     * @throws IOException Thrown if an exception occurs while issuing the HTTP request.
      * @return {@link TusUploader} instance.
+     * @throws ProtocolException Thrown if the remote server sent an unexpected response, e.g.
+     *                           wrong status codes or missing/invalid headers.
+     * @throws IOException       Thrown if an exception occurs while issuing the HTTP request.
      */
     public TusUploader resumeOrCreateUpload(@NotNull TusUpload upload) throws ProtocolException, IOException {
         try {
@@ -317,13 +326,8 @@ public class TusClient {
      * @param connection The connection whose headers will be modified.
      */
     public void prepareConnection(@NotNull HttpURLConnection connection) {
-        // Only follow redirects, if the POST methods is preserved. If http.strictPostRedirect is
-        // disabled, a POST request will be transformed into a GET request which is not wanted by us.
 
-        // CHECKSTYLE:OFF
-        // LineLength - Necessary because of length of the link
-        // See:https://github.com/openjdk/jdk/blob/jdk7-b43/jdk/src/share/classes/sun/net/www/protocol/http/HttpURLConnection.java#L2020-L2035
-        // CHECKSTYLE:ON
+
         connection.setInstanceFollowRedirects(Boolean.getBoolean("http.strictPostRedirect"));
 
         connection.setConnectTimeout(connectTimeout);
@@ -346,5 +350,53 @@ public class TusClient {
         if (resumingEnabled && removeFingerprintOnSuccessEnabled) {
             urlStore.remove(upload.getFingerprint());
         }
+    }
+
+    protected Request.Builder getRequestBuilderWithHeaders() {
+        Request.Builder requestBuilder = new Request.Builder();
+        requestBuilder.addHeader("Tus-Resumable", TUS_VERSION);
+
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                requestBuilder.addHeader(entry.getKey(), entry.getValue());
+            }
+        }
+        return requestBuilder;
+    }
+
+    /**
+     * If you need to modify existing Tus OkHttpClient use this method
+     *
+     * For example you need to wrap with external sdk:
+     *
+     * OkHttpClient newHttpClient = SomeSdk.wrapOkHttpClient(tusClient.getOrCreateOkHttpClient());
+     * tusClient.setOkHttpClient(newHttpClient);
+     *
+     * @param okHttpClient - your custom OkHttpClient. Recomment to use {@link #getOrCreateOkHttpClient()}
+     *                     and modify existing client, cause it contains some default parameters
+     */
+    public void setOkHttpClient(OkHttpClient okHttpClient) {
+        this.okHttpClient = okHttpClient;
+    }
+
+    /**
+     * This method return or create OkHttpClient, which used for chunk uploading
+     * You can set custom parameters to client and then call {@link #setOkHttpClient(OkHttpClient)}
+     *
+     * For example you need to wrap with external sdk:
+     *
+     * OkHttpClient newHttpClient = SomeSdk.wrapOkHttpClient(tusClient.getOrCreateOkHttpClient());
+     * tusClient.setOkHttpClient(newHttpClient);
+     *
+     * @return OkHttpClient - new or in current usage. The OkHttpClient object is singleton in library.
+     */
+    public OkHttpClient getOrCreateOkHttpClient() {
+        if (okHttpClient == null) {
+            okHttpClient = new OkHttpClient.Builder()
+                    .connectTimeout(connectTimeout, TimeUnit.MILLISECONDS)
+                    .followRedirects(true)
+                    .build();
+        }
+        return okHttpClient;
     }
 }

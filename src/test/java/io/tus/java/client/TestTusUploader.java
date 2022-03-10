@@ -63,9 +63,7 @@ public class TestTusUploader extends MockServerProvider {
         assertEquals(uploader.getChunkSize(), 5);
 
         assertEquals(5, uploader.uploadChunk());
-        assertEquals(3, uploader.uploadChunk(5));
         assertEquals(-1, uploader.uploadChunk());
-        assertEquals(-1, uploader.uploadChunk(5));
         assertEquals(11, uploader.getOffset());
         uploader.finish();
     }
